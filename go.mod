@@ -1,16 +1,18 @@
-module knative.dev/sample-controller
+module knative.dev/eventing-contrib/rocketmq/
 
 go 1.14
 
 require (
 	github.com/google/licenseclassifier v0.0.0-20200708223521-3d09a0ea2f39
-	go.uber.org/zap v1.14.1
+	go.uber.org/zap v1.14.1 // indirect
 	k8s.io/api v0.17.6
 	k8s.io/apimachinery v0.18.6
 	k8s.io/client-go v11.0.1-0.20190805182717-6502b5e7b1b5+incompatible
 	k8s.io/code-generator v0.18.0
 	k8s.io/kube-openapi v0.0.0-20200410145947-bcb3869e6f29
+	knative.dev/eventing v0.16.1
 	knative.dev/pkg v0.0.0-20200729214559-47e34f1f4ef1
+	knative.dev/sample-controller v0.0.0-20200730181900-985695ab7ba5
 	knative.dev/test-infra v0.0.0-20200729161259-d21e6ed450cb
 )
 

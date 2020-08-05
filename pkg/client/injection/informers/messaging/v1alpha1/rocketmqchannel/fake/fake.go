@@ -21,25 +21,20 @@ package fake
 import (
 	context "context"
 
-	externalversions "knative.dev/eventing-contrib/tmp2/pkg/client/informers/externalversions"
-	fake "knative.dev/eventing-contrib/tmp2/pkg/client/injection/client/fake"
-	factory "knative.dev/eventing-contrib/tmp2/pkg/client/injection/informers/factory"
+	fake "knative.dev/eventing-contrib/tmp2/pkg/client/injection/informers/factory/fake"
+	rocketmqchannel "knative.dev/eventing-contrib/tmp2/pkg/client/injection/informers/messaging/v1alpha1/rocketmqchannel"
 	controller "knative.dev/pkg/controller"
 	injection "knative.dev/pkg/injection"
 )
 
-var Get = factory.Get
+var Get = rocketmqchannel.Get
 
 func init() {
-	injection.Fake.RegisterInformerFactory(withInformerFactory)
+	injection.Fake.RegisterInformer(withInformer)
 }
 
-func withInformerFactory(ctx context.Context) context.Context {
-	c := fake.Get(ctx)
-	opts := make([]externalversions.SharedInformerOption, 0, 1)
-	if injection.HasNamespaceScope(ctx) {
-		opts = append(opts, externalversions.WithNamespace(injection.GetNamespaceScope(ctx)))
-	}
-	return context.WithValue(ctx, factory.Key{},
-		externalversions.NewSharedInformerFactoryWithOptions(c, controller.GetResyncPeriod(ctx), opts...))
+func withInformer(ctx context.Context) (context.Context, controller.Informer) {
+	f := fake.Get(ctx)
+	inf := f.Messaging().V1alpha1().RocketmqChannels()
+	return context.WithValue(ctx, rocketmqchannel.Key{}, inf), inf.Informer()
 }
