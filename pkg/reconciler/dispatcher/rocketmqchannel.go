@@ -18,60 +18,73 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"reflect"
-	"strings"
-
-	duckv1 "knative.dev/pkg/apis/duck/v1"
-
-	"knative.dev/pkg/injection"
 
 	"go.uber.org/zap"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
-	eventingduck "knative.dev/eventing/pkg/apis/duck/v1alpha1"
-	eventingduckv1beta1 "knative.dev/eventing/pkg/apis/duck/v1beta1"
-	messagingv1beta1 "knative.dev/eventing/pkg/apis/messaging/v1beta1"
+	eventingduckv1alpha1 "knative.dev/eventing/pkg/apis/duck/v1alpha1"
+	"knative.dev/eventing/pkg/apis/eventing"
+	"knative.dev/eventing/pkg/channel/fanout"
+	"knative.dev/eventing/pkg/channel/multichannelfanout"
 	"knative.dev/eventing/pkg/kncloudevents"
 	"knative.dev/eventing/pkg/logging"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
+	"knative.dev/pkg/injection"
+	pkgreconciler "knative.dev/pkg/reconciler"
 
-	"knative.dev/eventing-contrib/rocektmq/pkg/apis/messaging/v1alpha1"
-	clientset "knative.dev/eventing-contrib/rocektmq/pkg/client/clientset/versioned"
-	"knative.dev/eventing-contrib/rocektmq/pkg/client/injection/informers/messaging/v1alpha1/rocektmqchannel"
-	listers "knative.dev/eventing-contrib/rocektmq/pkg/client/listers/messaging/v1alpha1"
-	"knative.dev/eventing-contrib/rocektmq/pkg/dispatcher"
-	"knative.dev/eventing-contrib/rocektmq/pkg/util"
+	"knative.dev/eventing-contrib/rocketmq/channel/pkg/apis/messaging/v1alpha1"
+	rocketmqclientset "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/clientset/versioned"
+	rocketmqScheme "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/clientset/versioned/scheme"
+	rocketmqclientsetinjection "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/injection/client"
+	"knative.dev/eventing-contrib/rocketmq/channel/pkg/client/injection/informers/messaging/v1alpha1/rocketmqchannel"
+	listers "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/listers/messaging/v1alpha1"
+	"knative.dev/eventing-contrib/rocketmq/channel/pkg/dispatcher"
+	"knative.dev/eventing-contrib/rocketmq/channel/pkg/utils"
 )
+
+func init() {
+	// Add run types to the default Kubernetes Scheme so Events can be
+	// logged for run types.
+	_ = rocketmqScheme.AddToScheme(scheme.Scheme)
+}
 
 const (
 	// ReconcilerName is the name of the reconciler.
-	ReconcilerName = "RocektmqChannels"
+	ReconcilerName = "RocketmqChannels"
 
 	// controllerAgentName is the string used by this controller to identify
 	// itself when creating events.
-	controllerAgentName = "rocektmq-ch-dispatcher"
+	controllerAgentName = "rocketmq-ch-dispatcher"
 
-	finalizerName = controllerAgentName
+	// Name of the corev1.Events emitted from the reconciliation process.
+	channelReconciled         = "ChannelReconciled"
+	channelReconcileFailed    = "ChannelReconcileFailed"
+	channelUpdateStatusFailed = "ChannelUpdateStatusFailed"
 )
 
-// Reconciler reconciles RocektMQ Channels.
+// Reconciler reconciles Rocketmq Channels.
 type Reconciler struct {
-	rocektmqDispatcher dispatcher.RocektmqDispatcher
+	recorder record.EventRecorder
 
-	rocektmqClientSet clientset.Interface
+	rocketmqDispatcher *dispatcher.RocketmqDispatcher
 
-	rocektmqchannelLister listers.RocektmqChannelLister
-	impl                  *controller.Impl
+	rocketmqClientSet       rocketmqclientset.Interface
+	rocketmqchannelLister   listers.RocketmqChannelLister
+	rocketmqchannelInformer cache.SharedIndexInformer
+	impl                    *controller.Impl
 }
 
 // Check that our Reconciler implements controller.Reconciler.
@@ -83,51 +96,85 @@ func NewController(ctx context.Context, _ configmap.Watcher) *controller.Impl {
 
 	logger := logging.FromContext(ctx)
 
-	rocektmqConfig := util.GetRocektmqConfig()
-	dispatcherArgs := dispatcher.Args{
-		RocektmqURL: util.GetDefaultRocektmqURL(),
-		ClusterID:   util.GetDefaultClusterID(),
-		ClientID:    rocektmqConfig.ClientID,
-		Cargs: kncloudevents.ConnectionArgs{
-			MaxIdleConns:        rocektmqConfig.MaxIdleConns,
-			MaxIdleConnsPerHost: rocektmqConfig.MaxIdleConnsPerHost,
-		},
-		Logger: logger,
+	rocketmqConfig := utils.GetRocketmqConfig()
+	connectionArgs := &kncloudevents.ConnectionArgs{
+		MaxIdleConns:        int(rocketmqConfig.MaxIdleConns),
+		MaxIdleConnsPerHost: int(rocketmqConfig.MaxIdleConnsPerHost),
 	}
-	rocektmqDispatcher, err := dispatcher.NewDispatcher(dispatcherArgs)
+
+	rocketmqChannelInformer := rocketmqchannel.Get(ctx)
+	args := &dispatcher.RocketmqDispatcherArgs{
+		KnCEConnectionArgs: connectionArgs,
+		ClientID:           "rocketmq-ch-dispatcher",
+		Brokers:            rocketmqConfig.Brokers,
+		TopicFunc:          utils.TopicName,
+		Logger:             logger,
+	}
+	rocketmqDispatcher, err := dispatcher.NewDispatcher(ctx, args)
 	if err != nil {
-		logger.Fatal("Unable to create rocektmq dispatcher", zap.Error(err))
+		logger.Fatal("Unable to create rocketmq dispatcher", zap.Error(err))
 	}
-
-	logger = logger.With(zap.String("controller/impl", "pkg"))
-	logger.Info("Starting the RocektMQ dispatcher")
-
-	channelInformer := rocektmqchannel.Get(ctx)
+	logger.Info("Starting the Rocketmq dispatcher")
+	logger.Info("Rocketmq broker configuration", zap.Strings(utils.BrokerConfigMapKey, rocketmqConfig.Brokers))
 
 	r := &Reconciler{
-		rocektmqDispatcher:    rocektmqDispatcher,
-		rocektmqchannelLister: channelInformer.Lister(),
-		rocektmqClientSet:     clientset.NewForConfigOrDie(injection.GetConfig(ctx)),
+		recorder:                getRecorder(ctx, injection.GetConfig(ctx)),
+		rocketmqDispatcher:      rocketmqDispatcher,
+		rocketmqClientSet:       rocketmqclientsetinjection.Get(ctx),
+		rocketmqchannelLister:   rocketmqChannelInformer.Lister(),
+		rocketmqchannelInformer: rocketmqChannelInformer.Informer(),
 	}
 	r.impl = controller.NewImpl(r, logger.Sugar(), ReconcilerName)
 
 	logger.Info("Setting up event handlers")
 
-	channelInformer.Informer().AddEventHandler(controller.HandleAll(r.impl.Enqueue))
+	// Watch for rocketmq channels.
+	rocketmqChannelInformer.Informer().AddEventHandler(
+		cache.FilteringResourceEventHandler{
+			FilterFunc: filterWithAnnotation(injection.HasNamespaceScope(ctx)),
+			Handler:    controller.HandleAll(r.impl.Enqueue),
+		})
 
 	logger.Info("Starting dispatcher.")
 	go func() {
-		if err := rocektmqDispatcher.Start(ctx); err != nil {
+		if err := rocketmqDispatcher.Start(ctx); err != nil {
 			logger.Error("Cannot start dispatcher", zap.Error(err))
 		}
 	}()
+
 	return r.impl
 }
 
-// Reconcile a RocektmqChannel and perform the following actions:
-// - update rocektmq subscriptions based on RocektmqChannel subscribers
-// - set RocektmqChannel subscriber status based on rocektmq subscriptions
-// - maintain mapping between host header and rocektmq channel which is used by the dispatcher
+func getRecorder(ctx context.Context, cfg *rest.Config) record.EventRecorder {
+	recorder := controller.GetEventRecorder(ctx)
+	if recorder == nil {
+		// Create event broadcaster
+		logging.FromContext(ctx).Debug("Creating event broadcaster")
+		eventBroadcaster := record.NewBroadcaster()
+		watches := []watch.Interface{
+			eventBroadcaster.StartLogging(logging.FromContext(ctx).Sugar().Named("event-broadcaster").Infof),
+			eventBroadcaster.StartRecordingToSink(
+				&typedcorev1.EventSinkImpl{Interface: kubernetes.NewForConfigOrDie(cfg).CoreV1().Events("")}),
+		}
+		recorder = eventBroadcaster.NewRecorder(
+			scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
+		go func() {
+			<-ctx.Done()
+			for _, w := range watches {
+				w.Stop()
+			}
+		}()
+	}
+	return recorder
+}
+
+func filterWithAnnotation(namespaced bool) func(obj interface{}) bool {
+	if namespaced {
+		return pkgreconciler.AnnotationFilterFunc(eventing.ScopeAnnotationKey, "namespace", false)
+	}
+	return pkgreconciler.AnnotationFilterFunc(eventing.ScopeAnnotationKey, "cluster", true)
+}
+
 func (r *Reconciler) Reconcile(ctx context.Context, key string) error {
 	// Convert the namespace/name string into a distinct namespace and name.
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -136,218 +183,154 @@ func (r *Reconciler) Reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 
-	// Get the RocektmqChannel resource with this namespace/name.
-	original, err := r.rocektmqchannelLister.RocektmqChannels(namespace).Get(name)
+	// Get the RocketmqChannel resource with this namespace/name.
+	original, err := r.rocketmqchannelLister.RocketmqChannels(namespace).Get(name)
 	if apierrs.IsNotFound(err) {
 		// The resource may no longer exist, in which case we stop processing.
-		logging.FromContext(ctx).Error("RocektmqChannel key in work queue no longer exists")
+		logging.FromContext(ctx).Error("RocketmqChannel key in work queue no longer exists")
 		return nil
 	} else if err != nil {
 		return err
 	}
 
-	// Don't modify the informers copy.
-	rocektmqChannel := original.DeepCopy()
-
-	// See if the channel has been deleted.
-	if rocektmqChannel.DeletionTimestamp != nil {
-		c := toChannel(rocektmqChannel)
-
-		if _, err := r.rocektmqDispatcher.UpdateSubscriptions(ctx, c, true); err != nil {
-			logging.FromContext(ctx).Error("Error updating subscriptions", zap.Any("channel", c), zap.Error(err))
-			return err
-		}
-		removeFinalizer(rocektmqChannel)
-		_, err := r.rocektmqClientSet.MessagingV1alpha1().RocektmqChannels(rocektmqChannel.Namespace).Update(rocektmqChannel)
-		return err
-	}
-
-	if !rocektmqChannel.Status.IsReady() {
+	if !original.Status.IsReady() {
 		return fmt.Errorf("Channel is not ready. Cannot configure and update subscriber status")
 	}
 
-	reconcileErr := r.reconcile(ctx, rocektmqChannel)
+	// Don't modify the informers copy.
+	channel := original.DeepCopy()
+
+	// Reconcile this copy of the RocketmqChannel and then write back any status updates regardless of
+	// whether the reconcile error out.
+	reconcileErr := r.reconcile(ctx, channel)
 	if reconcileErr != nil {
-		logging.FromContext(ctx).Error("Error reconciling RocektmqChannel", zap.Error(reconcileErr))
+		logging.FromContext(ctx).Error("Error reconciling RocketmqChannel", zap.Error(reconcileErr))
+		r.recorder.Eventf(channel, corev1.EventTypeWarning, channelReconcileFailed, "RocketmqChannel reconciliation failed: %v", reconcileErr)
 	} else {
-		logging.FromContext(ctx).Debug("RocektmqChannel reconciled")
+		logging.FromContext(ctx).Debug("RocketmqChannel reconciled")
+		r.recorder.Event(channel, corev1.EventTypeNormal, channelReconciled, "RocketmqChannel reconciled")
 	}
 
 	// TODO: Should this check for subscribable status rather than entire status?
-	if _, updateStatusErr := r.updateStatus(ctx, rocektmqChannel); updateStatusErr != nil {
-		logging.FromContext(ctx).Error("Failed to update RocektmqChannel status", zap.Error(updateStatusErr))
+	if _, updateStatusErr := r.updateStatus(ctx, channel); updateStatusErr != nil {
+		logging.FromContext(ctx).Error("Failed to update RocketmqChannel status", zap.Error(updateStatusErr))
+		r.recorder.Eventf(channel, corev1.EventTypeWarning, channelUpdateStatusFailed, "Failed to update RocketmqChannel's status: %v", updateStatusErr)
 		return updateStatusErr
 	}
 
-	// Trigger reconciliation in case of errors
+	// Requeue if the resource is not ready
 	return reconcileErr
 }
 
-// reconcile performs the following steps
-// - add finalizer
-// - update rocektmq subscriptions
-// - set RocektmqChannel SubscribableStatus
-// - update host2channel map
-func (r *Reconciler) reconcile(ctx context.Context, rocektmqChannel *v1alpha1.RocektmqChannel) error {
-	// TODO update dispatcher API and use Channelable or RocektmqChannel.
-	c := toChannel(rocektmqChannel)
-
-	// If we are adding the finalizer for the first time, then ensure that finalizer is persisted
-	// before manipulating Rocektmq.
-	if err := r.ensureFinalizer(rocektmqChannel); err != nil {
-		return err
-	}
-
-	// Try to subscribe.
-	failedSubscriptions, err := r.rocektmqDispatcher.UpdateSubscriptions(ctx, c, false)
+func (r *Reconciler) reconcile(ctx context.Context, rc *v1alpha1.RocketmqChannel) error {
+	channels, err := r.rocketmqchannelLister.List(labels.Everything())
 	if err != nil {
-		logging.FromContext(ctx).Error("Error updating subscriptions", zap.Any("channel", c), zap.Error(err))
+		logging.FromContext(ctx).Error("Error listing rocketmq channels")
 		return err
 	}
 
-	rocektmqChannel.Status.SubscribableStatus = r.createSubscribableStatus(rocektmqChannel.Spec.Subscribable, failedSubscriptions)
+	// TODO: revisit this code. Instead of reading all channels and updating consumers and hostToChannel map for all
+	// why not just reconcile the current channel. With this the UpdateRocketmqConsumers can now return SubscribableStatus
+	// for the subscriptions on the channel that is being reconciled.
+	rocketmqChannels := make([]*v1alpha1.RocketmqChannel, 0)
+	for _, channel := range channels {
+		if channel.Status.IsReady() {
+			rocketmqChannels = append(rocketmqChannels, channel)
+		}
+	}
+	config := r.newConfigFromRocketmqChannels(rocketmqChannels)
+	if err := r.rocketmqDispatcher.UpdateHostToChannelMap(config); err != nil {
+		logging.FromContext(ctx).Error("Error updating host to channel map in dispatcher")
+		return err
+	}
+
+	failedSubscriptions, err := r.rocketmqDispatcher.UpdateRocketmqConsumers(config)
+	if err != nil {
+		logging.FromContext(ctx).Error("Error updating rocketmq consumers in dispatcher")
+		return err
+	}
+	for k, v := range failedSubscriptions {
+		newSub := eventingduckv1alpha1.SubscriberSpec{}
+		newSub.ConvertFrom(context.TODO(), k)
+		failedSubscriptions[newSub] = v
+	}
+	rc.Status.SubscribableTypeStatus.SubscribableStatus = r.createSubscribableStatus(rc.Spec.Subscribable, failedSubscriptions)
 	if len(failedSubscriptions) > 0 {
-		var b strings.Builder
-		for _, subError := range failedSubscriptions {
-			b.WriteString("\n")
-			b.WriteString(subError.Error())
-		}
-		errMsg := b.String()
-		logging.FromContext(ctx).Error(errMsg)
-		return fmt.Errorf(errMsg)
+		logging.FromContext(ctx).Error("Some rocketmq subscriptions failed to subscribe")
+		return fmt.Errorf("Some rocketmq subscriptions failed to subscribe")
 	}
-
-	rocektmqChannels, err := r.rocektmqchannelLister.List(labels.Everything())
-	if err != nil {
-		logging.FromContext(ctx).Error("Error listing rocektmq channels")
-		return err
-	}
-
-	channels := make([]messagingv1beta1.Channel, 0)
-	for _, nc := range rocektmqChannels {
-		if nc.Status.IsReady() {
-			channels = append(channels, *toChannel(nc))
-		}
-	}
-
-	if err := r.rocektmqDispatcher.ProcessChannels(ctx, channels); err != nil {
-		logging.FromContext(ctx).Error("Error updating host to channel map", zap.Error(err))
-		return err
-	}
-
 	return nil
 }
 
-// createSubscribableStatus creates the SubscribableStatus based on the failedSubscriptions
-// checks for each subscriber on the rocektmq channel if there is a failed subscription on rocektmq side
-// if there is no failed subscription => set ready status
-func (r *Reconciler) createSubscribableStatus(subscribable *eventingduck.Subscribable, failedSubscriptions map[eventingduck.SubscriberSpec]error) *eventingduck.SubscribableStatus {
+func (r *Reconciler) createSubscribableStatus(subscribable *eventingduckv1alpha1.Subscribable, failedSubscriptions map[eventingduckv1alpha1.SubscriberSpec]error) *eventingduckv1alpha1.SubscribableStatus {
 	if subscribable == nil {
 		return nil
 	}
-	subscriberStatus := make([]eventingduckv1beta1.SubscriberStatus, 0)
+	subscriberStatus := make([]eventingduckv1alpha1.SubscriberStatus, 0)
 	for _, sub := range subscribable.Subscribers {
-		status := eventingduckv1beta1.SubscriberStatus{
+		status := eventingduckv1alpha1.SubscriberStatus{
 			UID:                sub.UID,
 			ObservedGeneration: sub.Generation,
 			Ready:              corev1.ConditionTrue,
 		}
-
 		if err, ok := failedSubscriptions[sub]; ok {
 			status.Ready = corev1.ConditionFalse
 			status.Message = err.Error()
 		}
 		subscriberStatus = append(subscriberStatus, status)
 	}
-	return &eventingduck.SubscribableStatus{
+	return &eventingduckv1alpha1.SubscribableStatus{
 		Subscribers: subscriberStatus,
 	}
 }
 
-func (r *Reconciler) updateStatus(ctx context.Context, desired *v1alpha1.RocektmqChannel) (*v1alpha1.RocektmqChannel, error) {
-	nc, err := r.rocektmqchannelLister.RocektmqChannels(desired.Namespace).Get(desired.Name)
+// newConfigFromRocketmqChannels creates a new Config from the list of rocketmq channels.
+func (r *Reconciler) newChannelConfigFromRocketmqChannel(c *v1alpha1.RocketmqChannel) *multichannelfanout.ChannelConfig {
+	channelConfig := multichannelfanout.ChannelConfig{
+		Namespace: c.Namespace,
+		Name:      c.Name,
+		HostName:  c.Status.Address.Hostname,
+	}
+	if c.Spec.Subscribable != nil {
+		newSubs := make([]eventingduckv1alpha1.SubscriberSpec, len(c.Spec.Subscribable.Subscribers))
+		for i, source := range c.Spec.Subscribable.Subscribers {
+			source.ConvertTo(context.TODO(), &newSubs[i])
+			fmt.Printf("Converted \n%+v\n To\n%+v\n", source, newSubs[i])
+			fmt.Printf("Delivery converted \n%+v\nto\n%+v\n", source.Delivery, newSubs[i].Delivery)
+		}
+		channelConfig.FanoutConfig = fanout.Config{
+			AsyncHandler:  true,
+			Subscriptions: newSubs,
+		}
+	}
+	return &channelConfig
+}
+
+// newConfigFromRocketmqChannels creates a new Config from the list of rocketmq channels.
+func (r *Reconciler) newConfigFromRocketmqChannels(channels []*v1alpha1.RocketmqChannel) *multichannelfanout.Config {
+	cc := make([]multichannelfanout.ChannelConfig, 0)
+	for _, c := range channels {
+		channelConfig := r.newChannelConfigFromRocketmqChannel(c)
+		cc = append(cc, *channelConfig)
+	}
+	return &multichannelfanout.Config{
+		ChannelConfigs: cc,
+	}
+}
+func (r *Reconciler) updateStatus(ctx context.Context, desired *v1alpha1.RocketmqChannel) (*v1alpha1.RocketmqChannel, error) {
+	rc, err := r.rocketmqchannelLister.RocketmqChannels(desired.Namespace).Get(desired.Name)
 	if err != nil {
 		return nil, err
 	}
 
-	if reflect.DeepEqual(nc.Status, desired.Status) {
-		return nc, nil
+	if reflect.DeepEqual(rc.Status, desired.Status) {
+		return rc, nil
 	}
 
 	// Don't modify the informers copy.
-	existing := nc.DeepCopy()
+	existing := rc.DeepCopy()
 	existing.Status = desired.Status
 
-	return r.rocektmqClientSet.MessagingV1alpha1().RocektmqChannels(desired.Namespace).UpdateStatus(existing)
-}
-
-func (r *Reconciler) ensureFinalizer(channel *v1alpha1.RocektmqChannel) error {
-	finalizers := sets.NewString(channel.Finalizers...)
-	if finalizers.Has(finalizerName) {
-		return nil
-	}
-
-	mergePatch := map[string]interface{}{
-		"metadata": map[string]interface{}{
-			"finalizers":      append(channel.Finalizers, finalizerName),
-			"resourceVersion": channel.ResourceVersion,
-		},
-	}
-
-	patch, err := json.Marshal(mergePatch)
-	if err != nil {
-		return err
-	}
-
-	_, err = r.rocektmqClientSet.MessagingV1alpha1().RocektmqChannels(channel.Namespace).Patch(channel.Name, types.MergePatchType, patch)
-	return err
-}
-
-func removeFinalizer(channel *v1alpha1.RocektmqChannel) {
-	finalizers := sets.NewString(channel.Finalizers...)
-	finalizers.Delete(finalizerName)
-	channel.Finalizers = finalizers.List()
-}
-
-func toChannel(rocektmqChannel *v1alpha1.RocektmqChannel) *messagingv1beta1.Channel {
-	channel := &messagingv1beta1.Channel{
-		ObjectMeta: v1.ObjectMeta{
-			Name:      rocektmqChannel.Name,
-			Namespace: rocektmqChannel.Namespace,
-		},
-		Spec: messagingv1beta1.ChannelSpec{
-			ChannelTemplate: nil,
-			ChannelableSpec: eventingduckv1beta1.ChannelableSpec{
-				SubscribableSpec: eventingduckv1beta1.SubscribableSpec{},
-			},
-		},
-	}
-
-	if rocektmqChannel.Status.Address != nil {
-		channel.Status = messagingv1beta1.ChannelStatus{
-			ChannelableStatus: eventingduckv1beta1.ChannelableStatus{
-				AddressStatus: duckv1.AddressStatus{
-					Address: &duckv1.Addressable{
-						URL: rocektmqChannel.Status.Address.URL,
-					}},
-				SubscribableStatus: eventingduckv1beta1.SubscribableStatus{},
-				DeadLetterChannel:  nil,
-			},
-			Channel: nil,
-		}
-	}
-	if rocektmqChannel.Spec.Subscribable != nil {
-		for _, s := range rocektmqChannel.Spec.Subscribable.Subscribers {
-			sbeta1 := eventingduckv1beta1.SubscriberSpec{
-				UID:           s.UID,
-				Generation:    s.Generation,
-				SubscriberURI: s.SubscriberURI,
-				ReplyURI:      s.ReplyURI,
-				Delivery:      s.Delivery,
-			}
-			channel.Spec.Subscribers = append(channel.Spec.Subscribers, sbeta1)
-		}
-	}
-
-	return channel
+	new, err := r.rocketmqClientSet.MessagingV1alpha1().RocketmqChannels(desired.Namespace).UpdateStatus(existing)
+	return new, err
 }

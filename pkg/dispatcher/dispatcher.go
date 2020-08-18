@@ -13,417 +13,367 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 package dispatcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net/http"
+	nethttp "net/http"
 	"net/url"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	eventingduck "knative.dev/eventing/pkg/apis/duck/v1alpha1"
+	"github.com/apache/rocketmq-client-go/v2"
+	"github.com/apache/rocketmq-client-go/v2/primitive"
+	"github.com/apache/rocketmq-client-go/v2/producer"
+	"github.com/apache/rocketmq-client-go/v2/consumer"
 
-	"k8s.io/apimachinery/pkg/types"
-
-	"github.com/nats-io/stan.go"
-	"github.com/pkg/errors"
+	protocolrocketmq "github.com/cloudevents/sdk-go/protocol/rocketmq/v2"
+	"github.com/cloudevents/sdk-go/v2/binding"
 	"go.uber.org/zap"
-
-	messagingv1beta1 "knative.dev/eventing/pkg/apis/messaging/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
+	eventingduck "knative.dev/eventing/pkg/apis/duck/v1alpha1"
 	eventingchannels "knative.dev/eventing/pkg/channel"
+	"knative.dev/eventing/pkg/channel/multichannelfanout"
 	"knative.dev/eventing/pkg/kncloudevents"
 
-	"knative.dev/eventing-contrib/rocketmq/pkg/stanutil"
-
-	rocketmqcloudevents "github.com/cloudevents/sdk-go/protocol/stan/v2"
-	"github.com/cloudevents/sdk-go/v2/binding"
+	"knative.dev/eventing-contrib/rocketmq/channel/pkg/utils"
 )
 
-const (
-	// maxElements defines a maximum number of outstanding re-connect requests
-	maxElements = 10
-)
-
-var (
-	// retryInterval defines delay in seconds for the next attempt to reconnect to RocektMQ streaming server
-	retryInterval = 1 * time.Second
-)
-
-type SubscriptionChannelMapping map[eventingchannels.ChannelReference]map[types.UID]*stan.Subscription
-
-// SubscriptionsSupervisor manages the state of NATS Streaming subscriptions
-type SubscriptionsSupervisor struct {
-	logger *zap.Logger
+type RocketmqDispatcher struct {
+	hostToChannelMap atomic.Value
+	// hostToChannelMapLock is used to update hostToChannelMap
+	hostToChannelMapLock sync.Mutex
 
 	receiver   *eventingchannels.MessageReceiver
 	dispatcher *eventingchannels.MessageDispatcherImpl
 
-	subscriptionsMux sync.Mutex
-	subscriptions    SubscriptionChannelMapping
+	rocketmqAsyncProducer   rocketmq.Producer
+	channelSubscriptions map[eventingchannels.ChannelReference][]types.UID
+	subscriptions        map[types.UID]subscription
+	subsConsumers        map[types.UID]consumer.pushConsumer
+	// consumerUpdateLock must be used to update rocketmqConsumers
+	consumerUpdateLock   sync.Mutex
 
-	connect     chan struct{}
-	rocketmqURL string
-	clusterID   string
-	clientID    string
-	// natConnMux is used to protect rocketmqConn and rocketmqConnInProgress during
-	// the transition from not connected to connected states.
-	rocketmqConnMux        sync.Mutex
-	rocketmqConn           *stan.Conn
-	rocketmqConnInProgress bool
-
-	hostToChannelMap atomic.Value
+	topicFunc TopicFunc
+	logger    *zap.Logger
+	BrokerAddr    []string
+	GroupName     string
 }
 
-type RocketmqDispatcher interface {
-	Start(ctx context.Context) error
-	UpdateSubscriptions(ctx context.Context, channel *messagingv1beta1.Channel, isFinalizer bool) (map[eventingduck.SubscriberSpec]error, error)
-	ProcessChannels(ctx context.Context, chanList []messagingv1beta1.Channel) error
-}
+func NewDispatcher(ctx context.Context, args *RocketmqDispatcherArgs) (*RocketmqDispatcher, error) {
 
-type Args struct {
-	RocketmqURL string
-	ClusterID   string
-	ClientID    string
-	Cargs       kncloudevents.ConnectionArgs
-	Logger      *zap.Logger
-}
-
-// NewDispatcher returns a new RocketmqDispatcher.
-func NewDispatcher(args Args) (RocketmqDispatcher, error) {
-	if args.Logger == nil {
-		args.Logger = zap.NewNop()
+	producer, _ := rocketmq.NewProducer(
+		producer.WithNsResovler(primitive.NewPassthroughResolver([]string{args.BrokerAddr})),
+		producer.WithRetry(2),
+		producer.WithQueueSelector(producer.NewManualQueueSelector()),
+		producer.WithGroupName(args.GroupName)
+	)
+	err := producer.Start()
+	if err != nil {
+		return nil, fmt.Errorf("unable to create rocketmq producer: %v", err)
 	}
 
-	d := &SubscriptionsSupervisor{
-		logger:        args.Logger,
-		dispatcher:    eventingchannels.NewMessageDispatcher(args.Logger),
-		subscriptions: make(SubscriptionChannelMapping),
-		connect:       make(chan struct{}, maxElements),
-		rocketmqURL:   args.RocketmqURL,
-		clusterID:     args.ClusterID,
-		clientID:      args.ClientID,
+	dispatcher := &RocketmqDispatcher{
+		dispatcher:              eventingchannels.NewMessageDispatcher(args.Logger),
+		channelSubscriptions:    make(map[eventingchannels.ChannelReference][]types.UID),
+		subsConsumers:           make(map[types.UID]consumer.pushConsumer),
+		subscriptions:           make(map[types.UID]subscription),
+		rocketmqAsyncProducer:   producer,
+		logger:                  args.Logger,
+		topicFunc:               args.TopicFunc,
+		BrokerAddr:              args.BrokerAddr,
 	}
+	receiverFunc, err := eventingchannels.NewMessageReceiver(
+		func(ctx context.Context, channel eventingchannels.ChannelReference, message binding.Message, transformers []binding.Transformer, _ nethttp.Header) error {
+			rocketmqProducerMessage := primitive.NewMessage{
+				Topic: dispatcher.topicFunc(utils.RocketmqChannelSeparator, channel.Namespace, channel.Name),
+				Body: []byte("Hello RocketMQ Go Client!"),
+			}
 
-	receiver, err := eventingchannels.NewMessageReceiver(
-		messageReceiverFunc(d),
-		d.logger,
-		eventingchannels.ResolveMessageChannelFromHostHeader(d.getChannelReferenceFromHost))
+			dispatcher.logger.Debug("Received a new message from MessageReceiver, dispatching to Rocketmq", zap.Any("channel", channel))
+			err := protocolrocketmq.WriteProducerMessage(ctx, message, &rocketmqProducerMessage, transformers...)
+			if err != nil {
+				return err
+			}
+
+			err := dispatcher.kafkaAsyncProducer.SendAsync(ctx,
+				func(ctx context.Context, result *primitive.SendResult, e error) {
+					if e != nil {
+						fmt.Errorf("receive message error: %s\n", err)
+					} else {
+						fmt.Errorf("send message success: result=%s\n", result.String())
+					}
+				}, rocketmqProducerMessage)
+
+			if err != nil {
+				fmt.Errorf("send message error: %s\n", err)
+			}
+			return nil
+		},
+		args.Logger,
+		eventingchannels.ResolveMessageChannelFromHostHeader(dispatcher.getChannelReferenceFromHost))
 	if err != nil {
 		return nil, err
 	}
-	d.receiver = receiver
-	d.setHostToChannelMap(map[string]eventingchannels.ChannelReference{})
-	return d, nil
+
+	dispatcher.receiver = receiverFunc
+	dispatcher.setHostToChannelMap(map[string]eventingchannels.ChannelReference{})
+	return dispatcher, nil
 }
 
-func (s *SubscriptionsSupervisor) signalReconnect() {
-	select {
-	case s.connect <- struct{}{}:
-		// Sent.
-	default:
-		// The Channel is already full, so a reconnection attempt will occur.
+type TopicFunc func(separator, namespace, name string) string
+
+type RocketmqDispatcherArgs struct {
+	KnCEConnectionArgs *kncloudevents.ConnectionArgs
+	GroupName           string
+	BrokerAddr            []string
+	TopicFunc          TopicFunc
+	Logger             *zap.Logger
+}
+
+
+type subscription struct {
+	eventingduck.SubscriberSpec
+	Namespace string
+	Name      string
+}
+
+// UpdateRocketmqConsumers will be called by new CRD based rocketmq channel dispatcher controller.
+func (d *RocketmqDispatcher) UpdateRocketmqConsumers(config *multichannelfanout.Config) (map[eventingduck.SubscriberSpec]error, error) {
+	if config == nil {
+		return nil, fmt.Errorf("nil config")
 	}
-}
 
-func messageReceiverFunc(s *SubscriptionsSupervisor) eventingchannels.UnbufferedMessageReceiverFunc {
-	return func(ctx context.Context, channel eventingchannels.ChannelReference, message binding.Message, transformers []binding.Transformer, header http.Header) error {
-		s.logger.Info("Received event", zap.String("channel", channel.String()))
+	d.consumerUpdateLock.Lock()
+	defer d.consumerUpdateLock.Unlock()
 
-		s.rocketmqConnMux.Lock()
-		currentRocketmqConn := s.rocketmqConn
-		s.rocketmqConnMux.Unlock()
-		if currentRocketmqConn == nil {
-			s.logger.Error("no Connection to RocektMQ")
-			return errors.New("no Connection to RocektMQ")
-		}
-		sender, err := rocketmqcloudevents.NewSenderFromConn(*currentRocketmqConn, getSubject(channel))
-		if err != nil {
-			s.logger.Error("could not create rocketmq sender", zap.Error(err))
-			return errors.Wrap(err, "could not create rocketmq sender")
-		}
-		if err := sender.Send(ctx, message); err != nil {
-			errMsg := "error during send"
-			if err.Error() == stan.ErrConnectionClosed.Error() {
-				errMsg += " - connection to RocektMQ has been lost, attempting to reconnect"
-				s.signalReconnect()
-			}
-			s.logger.Error(errMsg, zap.Error(err))
-			return errors.Wrap(err, errMsg)
-		}
-		s.logger.Debug("published", zap.String("channel", channel.String()))
-		return nil
-	}
-}
-
-func (s *SubscriptionsSupervisor) Start(ctx context.Context) error {
-	// Starting Connect to establish connection with NATS
-	go s.Connect(ctx)
-	// Trigger Connect to establish connection with NATS
-	s.signalReconnect()
-	return s.receiver.Start(ctx)
-}
-
-func (s *SubscriptionsSupervisor) connectWithRetry(ctx context.Context) {
-	// re-attempting evey 1 second until the connection is established.
-	ticker := time.NewTicker(retryInterval)
-	defer ticker.Stop()
-	for {
-		nConn, err := stanutil.Connect(s.clusterID, s.clientID, s.rocketmqURL, s.logger.Sugar())
-		if err == nil {
-			// Locking here in order to reduce time in locked state.
-			s.rocketmqConnMux.Lock()
-			s.rocketmqConn = nConn
-			s.rocketmqConnInProgress = false
-			s.rocketmqConnMux.Unlock()
-			return
-		}
-		s.logger.Sugar().Errorf("Connect() failed with error: %+v, retrying in %s", err, retryInterval.String())
-		select {
-		case <-ticker.C:
-			continue
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// Connect is called for initial connection as well as after every disconnect
-func (s *SubscriptionsSupervisor) Connect(ctx context.Context) {
-	for {
-		select {
-		case <-s.connect:
-			s.rocketmqConnMux.Lock()
-			currentConnProgress := s.rocketmqConnInProgress
-			s.rocketmqConnMux.Unlock()
-			if !currentConnProgress {
-				// Case for lost connectivity, setting InProgress to true to prevent recursion
-				s.rocketmqConnMux.Lock()
-				s.rocketmqConnInProgress = true
-				s.rocketmqConnMux.Unlock()
-				go s.connectWithRetry(ctx)
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// UpdateSubscriptions creates/deletes the rocketmq subscriptions based on channel.Spec.Subscribable.Subscribers
-// Return type:map[eventingduck.SubscriberSpec]error --> Returns a map of subscriberSpec that failed with the value=error encountered.
-// Ignore the value in case error != nil
-func (s *SubscriptionsSupervisor) UpdateSubscriptions(ctx context.Context, channel *messagingv1beta1.Channel, isFinalizer bool) (map[eventingduck.SubscriberSpec]error, error) {
-	s.subscriptionsMux.Lock()
-	defer s.subscriptionsMux.Unlock()
-
+	var newSubs []types.UID
 	failedToSubscribe := make(map[eventingduck.SubscriberSpec]error)
-	cRef := eventingchannels.ChannelReference{Namespace: channel.Namespace, Name: channel.Name}
-	s.logger.Info("Update subscriptions", zap.String("cRef", cRef.String()), zap.String("subscribable", fmt.Sprintf("%v", channel)), zap.Bool("isFinalizer", isFinalizer))
-	if channel.Spec.Subscribers == nil || isFinalizer {
-		s.logger.Sugar().Infof("Empty subscriptions for channel Ref: %v; unsubscribe all active subscriptions, if any", cRef)
-		chMap, ok := s.subscriptions[cRef]
-		if !ok {
-			// nothing to do
-			s.logger.Sugar().Infof("No channel Ref %v found in subscriptions map", cRef)
-			return failedToSubscribe, nil
+	for _, cc := range config.ChannelConfigs {
+		channelRef := eventingchannels.ChannelReference{
+			Name:      cc.Name,
+			Namespace: cc.Namespace,
 		}
-		for sub := range chMap {
-			s.logger.Error("unsubscribe", zap.Error(s.unsubscribe(cRef, sub)))
+		for _, subSpec := range cc.FanoutConfig.Subscriptions {
+			sub := newSubscription(subSpec, string(subSpec.UID), cc.Namespace)
+			newSubs = append(newSubs, sub.UID)
+
+			// Check if sub already exists
+			exists := false
+			for _, s := range d.channelSubscriptions[channelRef] {
+				if s == sub.UID {
+					exists = true
+				}
+			}
+
+			if !exists {
+				// only subscribe when not exists in channel-subscriptions map
+				// do not need to resubscribe every time channel fanout config is updated
+				if err := d.subscribe(channelRef, sub); err != nil {
+					failedToSubscribe[subSpec] = err
+				}
+			}
 		}
-		delete(s.subscriptions, cRef)
-		return failedToSubscribe, nil
 	}
 
-	subscriptions := channel.Spec.Subscribers
-	activeSubs := make(map[types.UID]bool) // it's logically a set
+	d.logger.Debug("Number of new subs", zap.Any("subs", len(newSubs)))
+	d.logger.Debug("Number of subs failed to subscribe", zap.Any("subs", len(failedToSubscribe)))
 
-	chMap, ok := s.subscriptions[cRef]
-	if !ok {
-		chMap = make(map[types.UID]*stan.Subscription)
-		s.subscriptions[cRef] = chMap
-	}
+	// Unsubscribe and close consumer for any deleted subscriptions
+	for channelRef, subs := range d.channelSubscriptions {
+		for _, oldSub := range subs {
+			removedSub := true
+			for _, s := range newSubs {
+				if s == oldSub {
+					removedSub = false
+				}
+			}
 
-	for _, sub := range subscriptions {
-		// check if the subscription already exist and do nothing in this case
-		subRef := newSubscriptionReference(sub)
-		if _, ok := chMap[subRef.UID]; ok {
-			activeSubs[subRef.UID] = true
-			s.logger.Sugar().Infof("Subscription: %v already active for channel: %v", sub, cRef)
-			continue
+			if removedSub {
+				if err := d.unsubscribe(channelRef, d.subscriptions[oldSub]); err != nil {
+					return nil, err
+				}
+			}
 		}
-		// subscribe and update failedSubscription if subscribe fails
-		rocketmqSub, err := s.subscribe(ctx, cRef, subRef)
-		if err != nil {
-			s.logger.Sugar().Errorf("failed to subscribe (subscription:%q) to channel: %v. Error:%s", sub, cRef, err.Error())
-
-			subv1alpha1 := newSubscriptionReference(sub)
-			failedToSubscribe[eventingduck.SubscriberSpec(subv1alpha1)] = err
-			continue
-		}
-		chMap[subRef.UID] = rocketmqSub
-		activeSubs[subRef.UID] = true
-	}
-	// Unsubscribe for deleted subscriptions
-	for sub := range chMap {
-		if ok := activeSubs[sub]; !ok {
-			s.logger.Error("unsubscribe", zap.Error(s.unsubscribe(cRef, sub)))
-		}
-	}
-	// delete the channel from s.subscriptions if chMap is empty
-	if len(s.subscriptions[cRef]) == 0 {
-		delete(s.subscriptions, cRef)
+		d.channelSubscriptions[channelRef] = newSubs
 	}
 	return failedToSubscribe, nil
 }
 
-func (s *SubscriptionsSupervisor) subscribe(ctx context.Context, channel eventingchannels.ChannelReference, subscription subscriptionReference) (*stan.Subscription, error) {
-	s.logger.Info("Subscribe to channel:", zap.Any("channel", channel), zap.Any("subscription", subscription))
+// UpdateHostToChannelMap will be called by new CRD based rocketmq channel dispatcher controller.
+func (d *RocketmqDispatcher) UpdateHostToChannelMap(config *multichannelfanout.Config) error {
+	if config == nil {
+		return errors.New("nil config")
+	}
 
-	mcb := func(stanMsg *stan.Msg) {
+	d.hostToChannelMapLock.Lock()
+	defer d.hostToChannelMapLock.Unlock()
+
+	hcMap, err := createHostToChannelMap(config)
+	if err != nil {
+		return err
+	}
+
+	d.setHostToChannelMap(hcMap)
+	return nil
+}
+
+func createHostToChannelMap(config *multichannelfanout.Config) (map[string]eventingchannels.ChannelReference, error) {
+	hcMap := make(map[string]eventingchannels.ChannelReference, len(config.ChannelConfigs))
+	for _, cConfig := range config.ChannelConfigs {
+		if cr, ok := hcMap[cConfig.HostName]; ok {
+			return nil, fmt.Errorf(
+				"duplicate hostName found. Each channel must have a unique host header. HostName:%s, channel:%s.%s, channel:%s.%s",
+				cConfig.HostName,
+				cConfig.Namespace,
+				cConfig.Name,
+				cr.Namespace,
+				cr.Name)
+		}
+		hcMap[cConfig.HostName] = eventingchannels.ChannelReference{Name: cConfig.Name, Namespace: cConfig.Namespace}
+	}
+	return hcMap, nil
+}
+
+// Start starts the rocketmq dispatcher's message processing.
+func (d *RocketmqDispatcher) Start(ctx context.Context) error {
+	if d.receiver == nil {
+		return fmt.Errorf("message receiver is not set")
+	}
+
+	if d.rocketmqAsyncProducer == nil {
+		return fmt.Errorf("rocketmqAsyncProducer is not set")
+	}
+
+	err := d.rocketmqAsyncProducer.Start()
+	if err != nil {
+		fmt.Errorf("start producer error: %s", err.Error())
+	}
+
+	return d.receiver.Start(ctx)
+}
+
+// subscribe reads rocketmqConsumers which gets updated in UpdateConfig in a separate go-routine.
+// subscribe must be called under updateLock.
+func (d *RocketmqDispatcher) subscribe(ctx context.Context, channelRef eventingchannels.ChannelReference, sub subscription) error {
+	d.logger.Info("Subscribing", zap.Any("channelRef", channelRef), zap.Any("subscription", sub))
+
+	RocketmqHandler := (ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
 		defer func() {
 			if r := recover(); r != nil {
-				s.logger.Warn("Panic happened while handling a message",
-					zap.String("messages", stanMsg.String()),
-					zap.String("sub", string(subscription.UID)),
+				d.logger.Warn("Panic happened while handling a message",
+					zap.String("topic", Message.Topic),
+					zap.String("sub", string(sub.UID)),
 					zap.Any("panic value", r),
 				)
 			}
 		}()
-
-		message, err := rocketmqcloudevents.NewMessage(stanMsg, rocketmqcloudevents.WithManualAcks())
-		if err != nil {
-			s.logger.Error("could not create a message", zap.Error(err))
-			return
+		message := protocolrocketmq.NewMessageFromConsumerMessage(msgs.Message)
+		if message.ReadEncoding() == binding.EncodingUnknown {
+			return consumer.ConsumeRetryLater, errors.New("received a message with unknown encoding")
 		}
-		s.logger.Debug("RocektMQ message received", zap.String("subject", stanMsg.Subject), zap.Uint64("sequence", stanMsg.Sequence), zap.Time("timestamp", time.Unix(stanMsg.Timestamp, 0)))
-
 		var destination *url.URL
-		if !subscription.SubscriberURI.IsEmpty() {
-			destination = subscription.SubscriberURI.URL()
-			s.logger.Debug("dispatch message", zap.String("destination", destination.String()))
+		if !sub.SubscriberURI.IsEmpty() {
+			destination = sub.SubscriberURI.URL()
+			d.logger.Debug("dispatch message", zap.String("destination", destination.String()))
 		}
 		var reply *url.URL
-		if !subscription.ReplyURI.IsEmpty() {
-			reply = subscription.ReplyURI.URL()
-			s.logger.Debug("dispatch message", zap.String("reply", reply.String()))
+		if !sub.ReplyURI.IsEmpty() {
+			reply = sub.ReplyURI.URL()
+			d.logger.Debug("dispatch message", zap.String("reply", reply.String()))
 		}
 		var deadLetter *url.URL
-		if subscription.Delivery != nil && subscription.Delivery.DeadLetterSink != nil && !subscription.Delivery.DeadLetterSink.URI.IsEmpty() {
-			deadLetter = subscription.Delivery.DeadLetterSink.URI.URL()
-			s.logger.Debug("dispatch message", zap.String("deadLetter", deadLetter.String()))
+		if sub.Delivery != nil && sub.Delivery.DeadLetterSink != nil && !sub.Delivery.DeadLetterSink.URI.IsEmpty() {
+			deadLetter = sub.Delivery.DeadLetterSink.URI.URL()
+			d.logger.Debug("dispatch message", zap.String("deadLetter", deadLetter.String()))
 		}
-		if !subscription.DeadLetterSinkURI.IsEmpty() {
-			deadLetter = subscription.DeadLetterSinkURI.URL()
-			s.logger.Debug("dispatch message", zap.String("deadLetter", deadLetter.String()))
-		}
-
-		if err := s.dispatcher.DispatchMessage(ctx, message, nil, destination, reply, deadLetter); err != nil {
-			s.logger.Error("Failed to dispatch message: ", zap.Error(err))
-			return
-		}
-		if err := stanMsg.Ack(); err != nil {
-			s.logger.Error("failed to acknowledge message", zap.Error(err))
-		}
-
-		s.logger.Debug("message dispatched", zap.Any("channel", channel))
+		d.logger.Debug("Going to dispatch the message",
+			zap.String("topic", message.Topic),
+			zap.String("sub", string(sub.UID)),
+		)
+		err := d.dispatcher.DispatchMessage(ctx, message, nil, destination, reply, deadLetter)
+		// NOTE: only return `true` here if DispatchMessage actually delivered the message.
+		orderlyCtx, _ := primitive.GetOrderlyCtx(ctx)
+		d.logger.Debug("orderly context: %v\n", orderlyCtx)
+		d,logger.Debug("subscribe orderly callback: %v \n", msgs)
+		return consumer.ConsumeSuccess, nil
 	}
 
-	ch := getSubject(channel)
-	sub := subscription.String()
+	topicName := d.topicFunc(utils.RocketmqChannelSeparator, channelRef.Namespace, channelRef.Name)
+	groupID := fmt.Sprintf("rocketmq.%s.%s.%s", sub.Namespace, channelRef.Name, sub.Name)
 
-	s.rocketmqConnMux.Lock()
-	currentRocketmqConn := s.rocketmqConn
-	s.rocketmqConnMux.Unlock()
+	pc, _ := rocketmq.NewPushConsumer(
+		consumer.WithGroupName(d.GroupName),
+		consumer.WithNsResovler(primitive.NewPassthroughResolver(d.BrokerAddr)),
+		consumer.WithConsumerModel(consumer.Clustering),
+		consumer.WithConsumeFromWhere(consumer.ConsumeFromFirstOffset),
+		consumer.WithConsumerOrder(true),
+	)
+	err := pc.Subscribe(topicName, consumer.MessageSelector{}, RocketmqHandler)
 
-	if currentRocketmqConn == nil {
-		return nil, errors.New("no Connection to RocektMQ")
-	}
-
-	subscriber := &rocketmqcloudevents.RegularSubscriber{}
-	rocketmqSub, err := subscriber.Subscribe(*currentRocketmqConn, ch, mcb, stan.DurableName(sub), stan.SetManualAckMode(), stan.AckWait(1*time.Minute))
 	if err != nil {
-		s.logger.Error(" Create new RocektMQ Subscription failed: ", zap.Error(err))
-		if err.Error() == stan.ErrConnectionClosed.Error() {
-			s.logger.Error("Connection to RocektMQ has been lost, attempting to reconnect.")
-			// Informing SubscriptionsSupervisor to re-establish connection to NATS
-			s.signalReconnect()
-			return nil, err
-		}
-		return nil, err
-	}
-
-	s.logger.Sugar().Infof("RocektMQ Subscription created: %+v", rocketmqSub)
-	return &rocketmqSub, nil
-}
-
-// should be called only while holding subscriptionsMux
-func (s *SubscriptionsSupervisor) unsubscribe(channel eventingchannels.ChannelReference, subscription types.UID) error {
-	s.logger.Info("Unsubscribe from channel:", zap.Any("channel", channel), zap.Any("subscription", subscription))
-
-	if stanSub, ok := s.subscriptions[channel][subscription]; ok {
-		if err := (*stanSub).Unsubscribe(); err != nil {
-			s.logger.Error("Unsubscribing RocektMQ Streaming subscription failed: ", zap.Error(err))
-			return err
-		}
-		delete(s.subscriptions[channel], subscription)
-	}
-	return nil
-}
-
-func getSubject(channel eventingchannels.ChannelReference) string {
-	return channel.Name + "." + channel.Namespace
-}
-
-func (s *SubscriptionsSupervisor) getHostToChannelMap() map[string]eventingchannels.ChannelReference {
-	return s.hostToChannelMap.Load().(map[string]eventingchannels.ChannelReference)
-}
-
-func (s *SubscriptionsSupervisor) setHostToChannelMap(hcMap map[string]eventingchannels.ChannelReference) {
-	s.hostToChannelMap.Store(hcMap)
-}
-
-// NewHostNameToChannelRefMap parses each channel from cList and creates a map[string(Status.Address.HostName)]ChannelReference
-func newHostNameToChannelRefMap(cList []messagingv1beta1.Channel) (map[string]eventingchannels.ChannelReference, error) {
-	hostToChanMap := make(map[string]eventingchannels.ChannelReference, len(cList))
-	for _, c := range cList {
-		url := c.Status.Address.URL
-		if cr, present := hostToChanMap[url.Host]; present {
-			return nil, fmt.Errorf(
-				"duplicate hostName found. Each channel must have a unique host header. HostName:%s, channel:%s.%s, channel:%s.%s",
-				url.Host,
-				c.Namespace,
-				c.Name,
-				cr.Namespace,
-				cr.Name)
-		}
-		hostToChanMap[url.Host] = eventingchannels.ChannelReference{Name: c.Name, Namespace: c.Namespace}
-	}
-	return hostToChanMap, nil
-}
-
-// ProcessChannels will be called from the controller that watches rocketmq channels.
-// It will update internal hostToChannelMap which is used to resolve the hostHeader of the
-// incoming request to the correct ChannelReference in the receiver function.
-func (s *SubscriptionsSupervisor) ProcessChannels(ctx context.Context, chanList []messagingv1beta1.Channel) error {
-	s.logger.Debug("ProcessChannels", zap.Any("chanList", chanList))
-	hostToChanMap, err := newHostNameToChannelRefMap(chanList)
-	if err != nil {
-		s.logger.Info("ProcessChannels: Error occurred when creating the new hostToChannel map.", zap.Error(err))
+		// we can not create a consumer - logging that, with reason
+		d.logger.Info("Could not create proper consumer", zap.Error(err))
 		return err
 	}
-	s.setHostToChannelMap(hostToChanMap)
-	s.logger.Info("hostToChannelMap updated successfully.")
+
+	err = pc.Start()
+	if err != nil {
+		d.logger.Info("Start Consumer error", zap.Error(err))
+		return err
+	}
+
+	d.channelSubscriptions[channelRef] = append(d.channelSubscriptions[channelRef], sub.UID)
+	d.subscriptions[sub.UID] = sub
+	d.subsConsumers[sub.UID] = pc
+
 	return nil
 }
 
-func (s *SubscriptionsSupervisor) getChannelReferenceFromHost(host string) (eventingchannels.ChannelReference, error) {
-	chMap := s.getHostToChannelMap()
+// unsubscribe reads rocketmqConsumers which gets updated in UpdateConfig in a separate go-routine.
+// unsubscribe must be called under updateLock.
+func (d *RocketmqDispatcher) unsubscribe(channel eventingchannels.ChannelReference, sub subscription) error {
+	d.logger.Info("Unsubscribing from channel", zap.Any("channel", channel), zap.Any("subscription", sub))
+	delete(d.subscriptions, sub.UID)
+	if subsSlice, ok := d.channelSubscriptions[channel]; ok {
+		var newSlice []types.UID
+		for _, oldSub := range subsSlice {
+			if oldSub != sub.UID {
+				newSlice = append(newSlice, oldSub)
+			}
+		}
+		d.channelSubscriptions[channel] = newSlice
+	}
+	if consumer, ok := d.subsConsumerGroups[sub.UID]; ok {
+		delete(d.subsConsumerGroups, sub.UID)
+		return consumer.Close()
+	}
+	return nil
+}
+
+func (d *RocketmqDispatcher) getHostToChannelMap() map[string]eventingchannels.ChannelReference {
+	return d.hostToChannelMap.Load().(map[string]eventingchannels.ChannelReference)
+}
+
+func (d *RocketmqDispatcher) setHostToChannelMap(hcMap map[string]eventingchannels.ChannelReference) {
+	d.hostToChannelMap.Store(hcMap)
+}
+
+func (d *RocketmqDispatcher) getChannelReferenceFromHost(host string) (eventingchannels.ChannelReference, error) {
+	chMap := d.getHostToChannelMap()
 	cr, ok := chMap[host]
 	if !ok {
-		return cr, fmt.Errorf("Invalid HostName:%q. HostName not found in any of the watched rocketmq channels", host)
+		return cr, eventingchannels.UnknownHostError(host)
 	}
 	return cr, nil
+}
+
+func newSubscription(spec eventingduck.SubscriberSpec, name string, namespace string) subscription {
+	return subscription{
+		SubscriberSpec: spec,
+		Name:           name,
+		Namespace:      namespace,
+	}
 }

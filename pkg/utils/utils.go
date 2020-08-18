@@ -17,11 +17,7 @@ limitations under the License.
 package utils
 
 import (
-	"errors"
-	"fmt"
 	"strings"
-
-	"knative.dev/pkg/configmap"
 )
 
 const (
@@ -31,16 +27,11 @@ const (
 
 	RocketmqChannelSeparator = "."
 
-	// DefaultNumPartitions defines the default number of partitions
-	DefaultNumPartitions = 1
-
-	// DefaultReplicationFactor defines the default number of replications
-	DefaultReplicationFactor = 1
-
 	knativeRocketmqTopicPrefix = "knative-messaging-rocketmq"
 
 	DefaultMaxIdleConns        = 1000
 	DefaultMaxIdleConnsPerHost = 100
+	DefaultBrokers             = []string{"127.0.0.1:9876"}
 )
 
 type RocketmqConfig struct {
@@ -50,39 +41,12 @@ type RocketmqConfig struct {
 }
 
 // GetRocketmqConfig returns the details of the Rocketmq cluster.
-func GetRocketmqConfig(configMap map[string]string) (*RocketmqConfig, error) {
-	if len(configMap) == 0 {
-		return nil, fmt.Errorf("missing configuration")
-	}
-
-	config := &RocketmqConfig{
+func GetRocketmqConfig() (*RocketmqConfig, error) {
+	return RocketmqConfig{
+		Brokers:             DefaultBrokers,
 		MaxIdleConns:        DefaultMaxIdleConns,
 		MaxIdleConnsPerHost: DefaultMaxIdleConnsPerHost,
 	}
-
-	var bootstrapServers string
-
-	err := configmap.Parse(configMap,
-		configmap.AsString(BrokerConfigMapKey, &bootstrapServers),
-		configmap.AsInt32(MaxIdleConnectionsKey, &config.MaxIdleConns),
-		configmap.AsInt32(MaxIdleConnectionsPerHostKey, &config.MaxIdleConnsPerHost),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	if bootstrapServers == "" {
-		return nil, errors.New("missing or empty key bootstrapServers in configuration")
-	}
-	bootstrapServersSplitted := strings.Split(bootstrapServers, ",")
-	for _, s := range bootstrapServersSplitted {
-		if len(s) == 0 {
-			return nil, fmt.Errorf("empty %s value in configuration", BrokerConfigMapKey)
-		}
-	}
-	config.Brokers = bootstrapServersSplitted
-
-	return config, nil
 }
 
 func TopicName(separator, namespace, name string) string {

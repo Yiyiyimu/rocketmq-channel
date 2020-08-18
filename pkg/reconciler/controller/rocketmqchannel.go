@@ -224,7 +224,6 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, rc *v1alpha1.RocketmqCha
 	// Reconcile the k8s service representing the actual Channel. It points to the Dispatcher service via ExternalName
 	svc, err := r.reconcileChannelService(ctx, dispatcherNamespace, rc)
 	if err != nil {
-
 		return err
 	}
 	rc.Status.MarkChannelServiceTrue()
@@ -233,12 +232,12 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, rc *v1alpha1.RocketmqCha
 		Host:   names.ServiceHostName(svc.Name, svc.Namespace),
 	})
 
-	// close the connection
-	err = rocketmqClusterAdmin.Close()
-	if err != nil {
-		logger.Error("Error closing the connection", zap.Error(err))
-		return err
-	}
+	// close the connection (TODO)
+	//err = rocketmqClusterAdmin.Close()
+	//if err != nil {
+	//	logger.Error("Error closing the connection", zap.Error(err))
+	//	return err
+	//}
 
 	// Ok, so now the Dispatcher Deployment & Service have been created, we're golden since the
 	// dispatcher watches the Channel and where it needs to dispatch events to.
@@ -427,7 +426,7 @@ func (r *Reconciler) createClient(ctx context.Context, rc *v1alpha1.RocketmqChan
 	rocketmqClusterAdmin := r.rocketmqClusterAdmin
 	if rocketmqClusterAdmin == nil {
 		var err error
-		rocketmqClusterAdmin, err = resources.MakeClient(controllerAgentName, r.rocketmqConfig.Brokers)
+		rocketmqClusterAdmin, err = resources.MakeClient(controllerAgentName, r.rocketmqConfig.BrokerAddr)
 		if err != nil {
 			return nil, err
 		}
