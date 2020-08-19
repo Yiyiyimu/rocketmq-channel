@@ -17,15 +17,30 @@ limitations under the License.
 package main
 
 import (
-	// The set of controllers this controller process runs.
-	"knative.dev/sample-controller/pkg/reconciler/addressableservice"
+	"context"
+	"flag"
+	"os"
 
-	// This defines the shared main for injected controllers.
+	"knative.dev/pkg/configmap"
+	kncontroller "knative.dev/pkg/controller"
+	"knative.dev/pkg/injection"
 	"knative.dev/pkg/injection/sharedmain"
+	"knative.dev/pkg/signals"
+
+	"knative.dev/eventing-contrib/rocketmq/pkg/reconciler/controller"
 )
 
+const component = "rocketmqchannel_controller"
+
 func main() {
-	sharedmain.Main("controller",
-		addressableservice.NewController,
-	)
+	flag.Parse()
+	ctx := signals.NewContext()
+	ns := os.Getenv("NAMESPACE")
+	if ns != "" {
+		ctx = injection.WithNamespaceScope(ctx, ns)
+	}
+
+	sharedmain.MainWithContext(ctx, component, func(ctx context.Context, watcher configmap.Watcher) *kncontroller.Impl {
+		return controller.NewController(ctx)
+	})
 }

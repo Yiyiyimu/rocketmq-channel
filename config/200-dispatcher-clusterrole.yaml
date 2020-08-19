@@ -13,32 +13,32 @@
 # limitations under the License.
 
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: rocketmq-ch-controller
-  labels:
-    contrib.eventing.knative.dev/release: devel
-subjects:
-  - kind: ServiceAccount
-    name: rocketmq-ch-controller
-    namespace: knative-eventing
-roleRef:
-  kind: ClusterRole
-  name: rocketmq-ch-controller
-  apiGroup: rbac.authorization.k8s.io
-
----
-
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: ClusterRole
 metadata:
   name: rocketmq-ch-dispatcher
-subjects:
-  - kind: ServiceAccount
-    name: rocketmq-ch-dispatcher
-    namespace: knative-eventing
-roleRef:
-  kind: ClusterRole
-  name: rocketmq-ch-dispatcher
-  apiGroup: rbac.authorization.k8s.io
-
+rules:
+  - apiGroups:
+      - messaging.knative.dev
+    resources:
+      - rocketmqchannels
+      - rocketmqchannels/status
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - messaging.knative.dev
+    resources:
+      - rocketmqchannels/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - "" # Core API group.
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch

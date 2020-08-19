@@ -13,9 +13,9 @@
 # limitations under the License.
 
 apiVersion: v1
-kind: Namespace
+kind: ServiceAccount
 metadata:
-  name: knative-samples
+  name: controller
+  namespace: knative-samples
   labels:
-    istio-injection: enabled
     samples.knative.dev/release: devel

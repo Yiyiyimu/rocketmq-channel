@@ -12,33 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+apiVersion: v1
+kind: Service
 metadata:
-  name: rocketmq-ch-controller
+  name: rocketmq-ch-dispatcher
+  namespace: knative-eventing
   labels:
     contrib.eventing.knative.dev/release: devel
-subjects:
-  - kind: ServiceAccount
-    name: rocketmq-ch-controller
-    namespace: knative-eventing
-roleRef:
-  kind: ClusterRole
-  name: rocketmq-ch-controller
-  apiGroup: rbac.authorization.k8s.io
-
----
-
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: rocketmq-ch-dispatcher
-subjects:
-  - kind: ServiceAccount
-    name: rocketmq-ch-dispatcher
-    namespace: knative-eventing
-roleRef:
-  kind: ClusterRole
-  name: rocketmq-ch-dispatcher
-  apiGroup: rbac.authorization.k8s.io
-
+    messaging.knative.dev/channel: rocketmq-channel
+    messaging.knative.dev/role: dispatcher
+spec:
+  selector:
+    messaging.knative.dev/channel: rocketmq-channel
+    messaging.knative.dev/role: dispatcher
+  ports:
+  - name: http-dispatcher
+    port: 80
+    protocol: TCP
+    targetPort: 8080
