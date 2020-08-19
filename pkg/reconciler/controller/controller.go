@@ -39,9 +39,9 @@ import (
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/system"
 
-	rocketmqChannelClient "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/injection/client"
-	"knative.dev/eventing-contrib/rocketmq/channel/pkg/client/injection/informers/messaging/v1alpha1/rocketmqchannel"
-	rocketmqChannelReconciler "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/injection/reconciler/messaging/v1alpha1/rocketmqchannel"
+	rocketmqChannelClient "knative.dev/eventing-contrib/rocketmq/pkg/client/injection/client"
+	"knative.dev/eventing-contrib/rocketmq/pkg/client/injection/informers/messaging/v1alpha1/rocketmqchannel"
+	rocketmqChannelReconciler "knative.dev/eventing-contrib/rocketmq/pkg/client/injection/reconciler/messaging/v1alpha1/rocketmqchannel"
 	eventingClient "knative.dev/eventing/pkg/client/injection/client"
 )
 

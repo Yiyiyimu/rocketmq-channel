@@ -38,7 +38,7 @@ import (
 	"knative.dev/eventing/pkg/channel/multichannelfanout"
 	"knative.dev/eventing/pkg/kncloudevents"
 
-	"knative.dev/eventing-contrib/rocketmq/channel/pkg/utils"
+	"knative.dev/eventing-contrib/rocketmq/pkg/utils"
 )
 
 type RocketmqDispatcher struct {

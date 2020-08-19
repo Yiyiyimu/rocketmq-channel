@@ -45,14 +45,14 @@ import (
 	"knative.dev/pkg/injection"
 	pkgreconciler "knative.dev/pkg/reconciler"
 
-	"knative.dev/eventing-contrib/rocketmq/channel/pkg/apis/messaging/v1alpha1"
-	rocketmqclientset "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/clientset/versioned"
-	rocketmqScheme "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/clientset/versioned/scheme"
-	rocketmqclientsetinjection "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/injection/client"
-	"knative.dev/eventing-contrib/rocketmq/channel/pkg/client/injection/informers/messaging/v1alpha1/rocketmqchannel"
-	listers "knative.dev/eventing-contrib/rocketmq/channel/pkg/client/listers/messaging/v1alpha1"
-	"knative.dev/eventing-contrib/rocketmq/channel/pkg/dispatcher"
-	"knative.dev/eventing-contrib/rocketmq/channel/pkg/utils"
+	"knative.dev/eventing-contrib/rocketmq/pkg/apis/messaging/v1alpha1"
+	rocketmqclientset "knative.dev/eventing-contrib/rocketmq/pkg/client/clientset/versioned"
+	rocketmqScheme "knative.dev/eventing-contrib/rocketmq/pkg/client/clientset/versioned/scheme"
+	rocketmqclientsetinjection "knative.dev/eventing-contrib/rocketmq/pkg/client/injection/client"
+	"knative.dev/eventing-contrib/rocketmq/pkg/client/injection/informers/messaging/v1alpha1/rocketmqchannel"
+	listers "knative.dev/eventing-contrib/rocketmq/pkg/client/listers/messaging/v1alpha1"
+	"knative.dev/eventing-contrib/rocketmq/pkg/dispatcher"
+	"knative.dev/eventing-contrib/rocketmq/pkg/utils"
 )
 
 func init() {
