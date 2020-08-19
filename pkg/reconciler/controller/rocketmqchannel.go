@@ -379,7 +379,7 @@ func (r *Reconciler) reconcileDispatcherService(ctx context.Context, dispatcherN
 
 func (r *Reconciler) reconcileChannelService(ctx context.Context, dispatcherNamespace string, channel *v1alpha1.RocketmqChannel) (*corev1.Service, error) {
 	logger := logging.FromContext(ctx)
-	// Get the  Service and propagate the status to the Channel in case it does not exist.
+	// Get the Service and propagate the status to the Channel in case it does not exist.
 	// We don't do anything with the service because it's status contains nothing useful, so just do
 	// an existence check. Then below we check the endpoints targeting it.
 	// We may change this name later, so we have to ensure we use proper addressable when resolving these.
@@ -449,17 +449,6 @@ func (r *Reconciler) createTopic(ctx context.Context, channel *v1alpha1.Rocketmq
 	}
 	return nil
 
-	//ErrTopicAlreadyExists have not been implemented yet
-	/*
-		if e, ok := err.(*sarama.TopicError); ok && e.Err == sarama.ErrTopicAlreadyExists {
-			return nil
-		} else if err != nil {
-			logger.Error("Error creating topic", zap.String("topic", topicName), zap.Error(err))
-		} else {
-			logger.Info("Successfully created topic", zap.String("topic", topicName))
-		}
-		return err
-	*/
 }
 
 func (r *Reconciler) deleteTopic(ctx context.Context, channel *v1alpha1.RocketmqChannel, rocketmqClusterAdmin admin.Admin) error {
@@ -473,16 +462,7 @@ func (r *Reconciler) deleteTopic(ctx context.Context, channel *v1alpha1.Rocketmq
 		return err
 	}
 	return nil
-	/*
-		if err == sarama.ErrUnknownTopicOrPartition {
-			return nil
-		} else if err != nil {
-			logger.Error("Error deleting topic", zap.String("topic", topicName), zap.Error(err))
-		} else {
-			logger.Info("Successfully deleted topic", zap.String("topic", topicName))
-		}
-		return err
-	*/
+	//ErrTopicAlreadyExists have not been implemented yet
 }
 
 func (r *Reconciler) updateRocketmqConfig(ctx context.Context, configMap *corev1.ConfigMap) {

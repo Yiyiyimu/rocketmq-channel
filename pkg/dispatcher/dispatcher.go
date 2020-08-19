@@ -52,7 +52,7 @@ type RocketmqDispatcher struct {
 	rocketmqAsyncProducer   rocketmq.Producer
 	channelSubscriptions map[eventingchannels.ChannelReference][]types.UID
 	subscriptions        map[types.UID]subscription
-	subsConsumers        map[types.UID]consumer.pushConsumer
+	subsConsumers        map[types.UID]rocketmq.PushConsumer
 	// consumerUpdateLock must be used to update rocketmqConsumers
 	consumerUpdateLock   sync.Mutex
 
